@@ -247,12 +247,14 @@ class SQLQueryTool:
             row_cap=ROW_CAP,
             question=question,
         )
-        resp = self._model.generate_content(prompt)
+        from agent.portfolio_agent import _call_with_backoff
+        resp = _call_with_backoff(self._model.generate_content, prompt)
         return _strip_fences(resp.text)
 
     def _repair(self, bad_sql: str, error: str) -> str:
         prompt = _REPAIR_PROMPT.format(sql=bad_sql, error=error)
-        resp = self._model.generate_content(prompt)
+        from agent.portfolio_agent import _call_with_backoff
+        resp = _call_with_backoff(self._model.generate_content, prompt)
         return _strip_fences(resp.text)
 
     def _execute_with_retry(

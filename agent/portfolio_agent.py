@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 HERE         = Path(__file__).parent.parent.resolve()
 DEFAULT_DB   = HERE / "portfolio.db"
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 MAX_INPUT_LEN = 2000
 
 # ---------------------------------------------------------------------------
@@ -99,9 +99,10 @@ portfolio name (as given by the user) to exposure_calculator.
 """
 
 
-def _call_with_backoff(fn, *args, max_attempts: int = 5, **kwargs):
+def _call_with_backoff(fn, *args, max_attempts: int = 6, **kwargs):
     """Call *fn* with exponential backoff on 429 / ResourceExhausted."""
-    delay = 2.0
+    import re
+    delay = 10.0  # Start with 10s to satisfy Free Tier rate limits (5 RPM)
     for attempt in range(max_attempts):
         try:
             return fn(*args, **kwargs)
@@ -110,10 +111,14 @@ def _call_with_backoff(fn, *args, max_attempts: int = 5, **kwargs):
             if "429" in msg or "resource_exhausted" in msg or "quota" in msg:
                 if attempt + 1 == max_attempts:
                     raise
+                # Check if API suggested a retry delay
+                match = re.search(r"retry in (\d+(?:\.\d+)?)s", str(exc), re.IGNORECASE)
+                if match:
+                    delay = max(delay, float(match.group(1)) + 1.5)
                 logger.warning("Rate-limited (attempt %d/%d). Sleeping %.1fs…",
                                attempt + 1, max_attempts, delay)
                 time.sleep(delay)
-                delay = min(delay * 2, 60.0)
+                delay = min(delay * 1.5, 60.0)
             else:
                 raise
 

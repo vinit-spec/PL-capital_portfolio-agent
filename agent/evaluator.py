@@ -392,8 +392,9 @@ class AgentEvaluator:
 
             if verbose:
                 print(f"  Agent: {str(res.get('answer', ''))[:200]}")
-                if res.get("tool_result", {}).get("sql"):
-                    print(f"  SQL:   {res['tool_result']['sql'][:150]}")
+                tr = res.get("tool_result") or {}
+                if tr.get("sql"):
+                    print(f"  SQL:   {tr['sql'][:150]}")
 
             results.append({
                 "id":           qid,
@@ -408,6 +409,10 @@ class AgentEvaluator:
                 "agent_answer": str(res.get("answer", ""))[:500],
                 "sql":          (res.get("tool_result") or {}).get("sql"),
             })
+
+            # Small pause between questions to respect API rate limits
+            if not getattr(self.agent, "mock", False):
+                time.sleep(2.0)
 
         total = len(self.questions)
         r_pct = routing_pass / total * 100
