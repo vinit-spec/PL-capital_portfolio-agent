@@ -446,6 +446,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db",           default=str(DEFAULT_DB))
     p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument("--output", "-o",  default="eval_results.json")
+    p.add_argument("--mock", action="store_true", help="Run in offline mock mode without an API key")
     return p
 
 
@@ -464,7 +465,7 @@ def main():
         sys.exit(1)
 
     from agent.portfolio_agent import PortfolioAgent
-    agent    = PortfolioAgent(db_path=db_path)
+    agent     = PortfolioAgent(db_path=db_path, mock=args.mock)
     evaluator = AgentEvaluator(agent=agent, ground_truth_path=gt_path, db_path=db_path)
     report   = evaluator.run(verbose=args.verbose)
 

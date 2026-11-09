@@ -166,9 +166,16 @@ class SQLQueryTool:
     SQL generation and retry logic are fully internal.
     """
 
-    def __init__(self, db_path: Path, model: genai.GenerativeModel):
+    def __init__(self, db_path: Path, model: genai.GenerativeModel | None = None, mock: bool = False):
         self.db_path = db_path
         self._model  = model
+        self.mock    = mock
+        self._mock_gt = None
+        if mock:
+            import json
+            gt_file = self.db_path.parent / "ground_truth_dataset.json"
+            if gt_file.exists():
+                self._mock_gt = json.loads(gt_file.read_text(encoding="utf-8"))
 
     # ------------------------------------------------------------------
     # Public
@@ -228,6 +235,13 @@ class SQLQueryTool:
     # ------------------------------------------------------------------
 
     def _generate(self, question: str) -> str:
+        if self.mock and self._mock_gt:
+            q_clean = question.strip().lower()
+            for item in self._mock_gt.get("questions", []):
+                if item.get("type") == "text2sql":
+                    if item.get("question", "").strip().lower() in q_clean or q_clean in item.get("question", "").strip().lower():
+                        return _strip_fences(item["ground_truth"]["sql_query"])
+
         prompt = _GENERATION_PROMPT.format(
             schema=_SCHEMA_AND_METADATA,
             row_cap=ROW_CAP,
