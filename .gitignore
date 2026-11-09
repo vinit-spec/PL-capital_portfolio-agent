@@ -1,0 +1,15 @@
+portfolio.db
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+eval_results.json
+diag1.py
+diag2.py
+
