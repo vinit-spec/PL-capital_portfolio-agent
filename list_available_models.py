@@ -9,7 +9,7 @@ Usage:
 import os
 import sys
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 
 load_dotenv()
 
@@ -20,17 +20,21 @@ if not api_key:
     print("GEMINI_API_KEY=your_key_here")
     sys.exit(1)
 
-genai.configure(api_key=api_key)
+client = genai.Client(api_key=api_key)
 
 print("🔍 Querying available Gemini models for your API key...")
 try:
-    models = genai.list_models()
     flash_models = []
     other_models = []
-    for m in models:
-        # Check if model supports generateContent
-        if "generateContent" in m.supported_generation_methods:
-            name = m.name.replace("models/", "")
+    for m in client.models.list():
+        name = m.name.replace("models/", "")
+        # Only include models that support generateContent
+        methods = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", [])
+        if hasattr(m, "supported_actions"):
+            supported = "generateContent" in (m.supported_actions or [])
+        else:
+            supported = "generateContent" in methods
+        if supported or "flash" in name.lower() or "gemini" in name.lower():
             if "flash" in name.lower():
                 flash_models.append(name)
             else:
@@ -47,4 +51,3 @@ try:
 except Exception as e:
     print(f"❌ Error querying models: {e}")
     sys.exit(1)
-

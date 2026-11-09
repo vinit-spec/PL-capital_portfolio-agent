@@ -18,8 +18,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-import google.generativeai as genai
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types as gtypes
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -27,17 +28,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-HERE         = Path(__file__).parent.parent.resolve()
-DEFAULT_DB   = HERE / "portfolio.db"
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+HERE          = Path(__file__).parent.parent.resolve()
+DEFAULT_DB    = HERE / "portfolio.db"
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 MAX_INPUT_LEN = 2000
 
 # ---------------------------------------------------------------------------
 # Tool declarations (Gemini function-calling schema)
 # ---------------------------------------------------------------------------
-_SQL_DECL = genai.protos.Tool(
+_SQL_TOOL_DECL = gtypes.Tool(
     function_declarations=[
-        genai.protos.FunctionDeclaration(
+        gtypes.FunctionDeclaration(
             name="sql_query",
             description=(
                 "Answer questions about portfolio data by converting the "
@@ -46,11 +47,11 @@ _SQL_DECL = genai.protos.Tool(
                 "risk metrics, performance data, transactions, or any structured "
                 "question about portfolios, securities, holdings, or benchmarks."
             ),
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=gtypes.Schema(
+                type=gtypes.Type.OBJECT,
                 properties={
-                    "question": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "question": gtypes.Schema(
+                        type=gtypes.Type.STRING,
                         description="The natural language question to answer.",
                     )
                 },
@@ -60,9 +61,9 @@ _SQL_DECL = genai.protos.Tool(
     ]
 )
 
-_EXPOSURE_DECL = genai.protos.Tool(
+_EXPOSURE_TOOL_DECL = gtypes.Tool(
     function_declarations=[
-        genai.protos.FunctionDeclaration(
+        gtypes.FunctionDeclaration(
             name="exposure_calculator",
             description=(
                 "Calculate the sector exposure breakdown for a named portfolio. "
@@ -70,11 +71,11 @@ _EXPOSURE_DECL = genai.protos.Tool(
                 "(bonds excluded). Use when the user asks about sector exposure, "
                 "sector allocation, or sector breakdown of a specific portfolio."
             ),
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=gtypes.Schema(
+                type=gtypes.Type.OBJECT,
                 properties={
-                    "portfolio_name": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "portfolio_name": gtypes.Schema(
+                        type=gtypes.Type.STRING,
                         description="Name of the portfolio (approximate match is fine).",
                     )
                 },
@@ -100,7 +101,12 @@ portfolio name (as given by the user) to exposure_calculator.
 
 
 def _call_with_backoff(fn, *args, max_attempts: int = 6, **kwargs):
-    """Call *fn* with exponential backoff on 429 / ResourceExhausted."""
+    """Call *fn* with exponential backoff on 429 / ResourceExhausted.
+
+    Daily quota exhaustion (RESOURCE_EXHAUSTED with no retry-after hint and
+    mentioning 'daily' or 'per day') is NOT retriable — raises immediately.
+    Per-minute rate limits are retried with exponential backoff.
+    """
     import re
     delay = 10.0  # Start with 10s to satisfy Free Tier rate limits (5 RPM)
     for attempt in range(max_attempts):
@@ -108,10 +114,17 @@ def _call_with_backoff(fn, *args, max_attempts: int = 6, **kwargs):
             return fn(*args, **kwargs)
         except Exception as exc:
             msg = str(exc).lower()
-            if "429" in msg or "resource_exhausted" in msg or "quota" in msg:
+            is_rate_limited = "429" in msg or "resource_exhausted" in msg or "quota" in msg
+            if is_rate_limited:
+                # Daily quota: fail fast — retrying won't help
+                if "daily" in msg or "per day" in msg or "exceeded your" in msg:
+                    raise RuntimeError(
+                        "Daily API quota exhausted. Create a new key at "
+                        "https://aistudio.google.com/app/apikey and update .env"
+                    ) from exc
                 if attempt + 1 == max_attempts:
                     raise
-                # Check if API suggested a retry delay
+                # Per-minute rate limit: check if API suggested a retry delay
                 match = re.search(r"retry in (\d+(?:\.\d+)?)s", str(exc), re.IGNORECASE)
                 if match:
                     delay = max(delay, float(match.group(1)) + 1.5)
@@ -137,9 +150,8 @@ class PortfolioAgent:
         from agent.tools.exposure_tool import ExposureCalculatorTool
 
         if self.mock:
-            self._model         = None
-            self._sql_gen_model = None
-            self._sql_tool      = SQLQueryTool(db_path=self.db_path, model=None, mock=True)
+            self._client        = None
+            self._sql_tool      = SQLQueryTool(db_path=self.db_path, client=None, mock=True)
             self._exp_tool      = ExposureCalculatorTool(db_path=self.db_path)
             return
 
@@ -148,19 +160,11 @@ class PortfolioAgent:
             raise EnvironmentError(
                 "GEMINI_API_KEY not set. Add it to .env or export it."
             )
-        genai.configure(api_key=key)
 
-        # Disable automatic function calling so we handle dispatch ourselves
-        self._model = genai.GenerativeModel(
-            model_name=DEFAULT_MODEL,
-            system_instruction=_SYSTEM_PROMPT,
-            tools=[_SQL_DECL, _EXPOSURE_DECL],
-        )
-
-        # SQL tool gets its own lightweight model (no tools attached)
-        self._sql_gen_model = genai.GenerativeModel(model_name=DEFAULT_MODEL)
-        self._sql_tool      = SQLQueryTool(db_path=self.db_path, model=self._sql_gen_model)
-        self._exp_tool      = ExposureCalculatorTool(db_path=self.db_path)
+        # New SDK: single Client object
+        self._client   = genai.Client(api_key=key)
+        self._sql_tool = SQLQueryTool(db_path=self.db_path, client=self._client)
+        self._exp_tool = ExposureCalculatorTool(db_path=self.db_path)
 
     # ------------------------------------------------------------------
     # Public
@@ -243,19 +247,26 @@ class PortfolioAgent:
 
         try:
             # ── Turn 1: ask Gemini which tool to call ──────────────────
-            chat = self._model.start_chat()
-            resp = _call_with_backoff(
-                chat.send_message,
-                question,
-                generation_config=genai.types.GenerationConfig(
-                    # Disable automatic function calling at request level
+            # Manual function calling: automatic_function_calling disabled
+            config = gtypes.GenerateContentConfig(
+                system_instruction=_SYSTEM_PROMPT,
+                tools=[_SQL_TOOL_DECL, _EXPOSURE_TOOL_DECL],
+                automatic_function_calling=gtypes.AutomaticFunctionCallingConfig(
+                    disable=True
                 ),
+            )
+
+            resp = _call_with_backoff(
+                self._client.models.generate_content,
+                model=DEFAULT_MODEL,
+                contents=question,
+                config=config,
             )
 
             fn_call = self._extract_fn_call(resp)
             if fn_call is None:
                 # Gemini responded with text — log and return as-is
-                out["answer"] = resp.text.strip()
+                out["answer"] = resp.text.strip() if resp.text else "No answer generated."
                 logger.warning("[agent] No tool call in response; returning text.")
                 return out
 
@@ -280,14 +291,29 @@ class PortfolioAgent:
                 return out
 
             # ── Turn 2: send result back for a natural-language answer ─
-            fn_resp_part = genai.protos.Part(
-                function_response=genai.protos.FunctionResponse(
-                    name=tool_name,
-                    response={"result": tool_result["result_text"]},
-                )
+            # Build a multi-turn conversation history
+            history = [
+                gtypes.Content(role="user", parts=[gtypes.Part(text=question)]),
+                gtypes.Content(role="model", parts=[gtypes.Part(
+                    function_call=gtypes.FunctionCall(name=tool_name, args=tool_args)
+                )]),
+                gtypes.Content(role="user", parts=[gtypes.Part(
+                    function_response=gtypes.FunctionResponse(
+                        name=tool_name,
+                        response={"result": tool_result["result_text"]},
+                    )
+                )]),
+            ]
+
+            final = _call_with_backoff(
+                self._client.models.generate_content,
+                model=DEFAULT_MODEL,
+                contents=history,
+                config=gtypes.GenerateContentConfig(
+                    system_instruction=_SYSTEM_PROMPT,
+                ),
             )
-            final = _call_with_backoff(chat.send_message, fn_resp_part)
-            out["answer"] = final.text.strip()
+            out["answer"] = final.text.strip() if final.text else tool_result["result_text"]
 
         except Exception as exc:
             logger.error("[agent] %s", exc, exc_info=True)
@@ -302,9 +328,11 @@ class PortfolioAgent:
 
     @staticmethod
     def _extract_fn_call(response):
-        for part in response.parts:
-            if hasattr(part, "function_call") and part.function_call.name:
-                return part.function_call
+        """Extract the first function_call part from a GenerateContentResponse."""
+        for candidate in response.candidates:
+            for part in candidate.content.parts:
+                if part.function_call and part.function_call.name:
+                    return part.function_call
         return None
 
 

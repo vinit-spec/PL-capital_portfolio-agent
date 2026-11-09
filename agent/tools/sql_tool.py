@@ -14,8 +14,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import google.generativeai as genai
-
 logger = logging.getLogger(__name__)
 
 ROW_CAP = 200          # max rows returned from any query
@@ -166,9 +164,9 @@ class SQLQueryTool:
     SQL generation and retry logic are fully internal.
     """
 
-    def __init__(self, db_path: Path, model: genai.GenerativeModel | None = None, mock: bool = False):
+    def __init__(self, db_path: Path, client=None, mock: bool = False):
         self.db_path = db_path
-        self._model  = model
+        self._client = client
         self.mock    = mock
         self._mock_gt = None
         if mock:
@@ -247,14 +245,22 @@ class SQLQueryTool:
             row_cap=ROW_CAP,
             question=question,
         )
-        from agent.portfolio_agent import _call_with_backoff
-        resp = _call_with_backoff(self._model.generate_content, prompt)
+        from agent.portfolio_agent import _call_with_backoff, DEFAULT_MODEL
+        resp = _call_with_backoff(
+            self._client.models.generate_content,
+            model=DEFAULT_MODEL,
+            contents=prompt,
+        )
         return _strip_fences(resp.text)
 
     def _repair(self, bad_sql: str, error: str) -> str:
         prompt = _REPAIR_PROMPT.format(sql=bad_sql, error=error)
-        from agent.portfolio_agent import _call_with_backoff
-        resp = _call_with_backoff(self._model.generate_content, prompt)
+        from agent.portfolio_agent import _call_with_backoff, DEFAULT_MODEL
+        resp = _call_with_backoff(
+            self._client.models.generate_content,
+            model=DEFAULT_MODEL,
+            contents=prompt,
+        )
         return _strip_fences(resp.text)
 
     def _execute_with_retry(
