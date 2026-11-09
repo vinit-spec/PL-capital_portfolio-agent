@@ -47,3 +47,4 @@ try:
 except Exception as e:
     print(f"❌ Error querying models: {e}")
     sys.exit(1)
+
